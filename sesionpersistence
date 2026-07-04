@@ -1,0 +1,282 @@
+/**
+ * sessionPersistence.js — BioKaizen Solutions / UPGES v1
+ *
+ * Capa de persistencia del estado "grabando" entre cierres de app.
+ *
+ * ESTRATEGIA (capas, más robusta posible):
+ * ┌─────────────────────────────────────────────────────┐
+ * │ Capa 1  — Capacitor Preferences (nativo iOS/Android)│
+ * │   Guarda: { recording, flightId, startedAt, ... }   │
+ * │   Survives: app kill, OS, reboot                    │
+ * ├─────────────────────────────────────────────────────┤
+ * │ Capa 1b — Capacitor Preferences (DRAFT COMPLETO)    │
+ * │   Guarda: draft entero (clima, cmf, eacFiz, dron…)  │
+ * │   Se sincroniza en START y al ir a segundo plano.   │
+ * │   Permite recuperar TODO si IndexedDB se pierde.    │
+ * ├─────────────────────────────────────────────────────┤
+ * │ Capa 2  — IndexedDB store 'activeSession'           │
+ * │   Guarda: draft completo del vuelo en curso         │
+ * │   Survives: página cerrada, recarga                 │
+ * ├─────────────────────────────────────────────────────┤
+ * │ Capa 3  — localStorage (fallback web/dev)           │
+ * │   Guarda: mismo JSON que Capacitor (flag ligero)    │
+ * │   Survives: recarga (no kill en móvil nativo)       │
+ * └─────────────────────────────────────────────────────┘
+ *
+ * Al arrancar la app → checkRecordingState() reconcilia las capas
+ * y devuelve el draft si había grabación en curso.
+ *
+ * recoveryMode:
+ *   'full'    → el draft completo sobrevivió en IndexedDB.
+ *   'partial' → IndexedDB se perdió; se recupera el draft desde Preferences
+ *               (Capa 1b) o, en último caso, se reconstruye desde startedAt.
+ */
+
+import { Preferences } from '@capacitor/preferences';
+import { getActiveSession, saveActiveSession, deleteActiveSession } from './flightOpsDB';
+
+const PREF_KEY = 'flight_ops_recording_state';
+const PREF_DRAFT_KEY = 'flight_ops_recording_draft'; // Draft completo (Capa 1b)
+const LS_KEY = 'upges_recording_state';
+
+// ─── Capacitor Preferences helpers (flag ligero) ─────────────────────────
+
+async function prefSet(data) {
+  try {
+    await Preferences.set({ key: PREF_KEY, value: JSON.stringify(data) });
+  } catch (e) {
+    console.warn('[SessionPersistence] Capacitor Preferences unavailable:', e);
+  }
+}
+
+async function prefGet() {
+  try {
+    const { value } = await Preferences.get({ key: PREF_KEY });
+    return value ? JSON.parse(value) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function prefRemove() {
+  try {
+    await Preferences.remove({ key: PREF_KEY });
+  } catch {
+    // silently ignore
+  }
+}
+
+// ─── Capacitor Preferences helpers (draft completo — Capa 1b) ────────────
+
+async function prefSetDraft(draft) {
+  if (!draft) return;
+  try {
+    await Preferences.set({ key: PREF_DRAFT_KEY, value: JSON.stringify(draft) });
+  } catch (e) {
+    // Un draft grande no debe romper la grabación: si falla, seguimos con IDB.
+    console.warn('[SessionPersistence] No se pudo guardar el draft en Preferences:', e);
+  }
+}
+
+async function prefGetDraft() {
+  try {
+    const { value } = await Preferences.get({ key: PREF_DRAFT_KEY });
+    return value ? JSON.parse(value) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function prefRemoveDraft() {
+  try {
+    await Preferences.remove({ key: PREF_DRAFT_KEY });
+  } catch {
+    // silently ignore
+  }
+}
+
+// ─── localStorage helpers (fallback) ────────────────────────────────────
+
+function lsSet(data) {
+  try {
+    localStorage.setItem(LS_KEY, JSON.stringify(data));
+  } catch {
+    // quota exceeded or private mode
+  }
+}
+
+function lsGet() {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function lsRemove() {
+  try {
+    localStorage.removeItem(LS_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+// ─── Public API ──────────────────────────────────────────────────────────
+
+/**
+ * Persiste el estado de grabación activa en todas las capas.
+ * Llamar inmediatamente después de START.
+ *
+ * @param {Object} session — createActiveSession() result
+ */
+export async function persistRecordingStart(session) {
+  const stateFlag = {
+    recording: true,
+    flightId: session.flightId,
+    startedAt: session.startedAt,
+    autoStopAt: session.autoStopAt,
+  };
+
+  // Capa 1 — Capacitor (flag ligero, más robusta en nativo)
+  await prefSet(stateFlag);
+
+  // Capa 1b — Draft COMPLETO en Preferences (sobrevive al kill del SO).
+  // Permite recuperar clima, CMF, EAC/FIZ, dron y baterías si IndexedDB se pierde.
+  await prefSetDraft(session.draft);
+
+  // Capa 2 — IndexedDB (draft completo)
+  await saveActiveSession(session);
+
+  // Capa 3 — localStorage (fallback)
+  lsSet(stateFlag);
+}
+
+/**
+ * Sincroniza el draft completo en Capacitor Preferences (Capa 1b).
+ * Se llama al pasar la app a segundo plano (appStateChange → isActive:false),
+ * que es el momento previo a un posible kill del SO por memoria.
+ *
+ * Es idempotente y tolerante a fallos: si Preferences no está disponible,
+ * no rompe nada (la grabación sigue viva en IndexedDB).
+ *
+ * @param {Object} draft — flight draft completo (draftRef.current)
+ */
+export async function snapshotDraftToPreferences(draft) {
+  await prefSetDraft(draft);
+}
+
+/**
+ * Actualiza el draft del vuelo en curso en IndexedDB (Capa 2) sin tocar
+ * el flag de Capacitor. Llamar cuando el usuario edita campos durante la
+ * grabación. NO reescribe el draft de Preferences en cada edición (eso se
+ * hace solo en START + segundo plano, por eficiencia).
+ *
+ * @param {Object} updatedDraft — flight draft actualizado
+ */
+export async function updateRecordingDraft(updatedDraft) {
+  const session = await getActiveSession();
+  if (!session) return;
+
+  await saveActiveSession({
+    ...session,
+    draft: {
+      ...updatedDraft,
+      updatedAt: new Date().toISOString(),
+    },
+  });
+}
+
+/**
+ * Limpia el estado de grabación de todas las capas.
+ * Llamar después de STOP (tanto si se completa como si se descarta).
+ */
+export async function clearRecordingState() {
+  // BUG FIX #2: limpiar Preferences PRIMERO (fuente de verdad del flag).
+  // Si la app muere a mitad, checkRecordingState verá recording=false
+  // y limpiará IDB correctamente en la próxima ejecución.
+  await prefRemove();
+  await prefRemoveDraft();
+  lsRemove();
+  await deleteActiveSession();
+}
+
+/**
+ * Comprueba si hay una grabación en curso al arrancar la app.
+ * Reconcilia las capas y devuelve el draft si existe.
+ *
+ * @returns {{
+ *   isRecording: boolean,
+ *   session: Object|null,
+ *   flightId: string|null,
+ *   startedAt?: string|null,
+ *   autoStopAt?: string|null,
+ *   prefDraft?: Object|null,
+ *   recoveryMode?: 'full'|'partial',
+ * }}
+ */
+export async function checkRecordingState() {
+  // Leer las capas (+ draft completo de Preferences para recovery partial)
+  const [prefState, idbSession, lsState, prefDraft] = await Promise.all([
+    prefGet(),
+    getActiveSession(),
+    Promise.resolve(lsGet()),
+    prefGetDraft(),
+  ]);
+
+  // No hay nada → clean state
+  if (!prefState && !idbSession && !lsState) {
+    return { isRecording: false, session: null, flightId: null };
+  }
+
+  // Fuente de verdad: Capacitor Preferences (más confiable en nativo)
+  // Fallback: localStorage → IDB
+  const flagState = prefState ?? lsState;
+
+  if (!flagState?.recording) {
+    // Flag dice que no graba → limpiar posibles restos huérfanos.
+    if (idbSession) await deleteActiveSession();
+    await prefRemoveDraft();
+    return { isRecording: false, session: null, flightId: null };
+  }
+
+  // Solo adjuntamos el draft de Preferences si corresponde al mismo vuelo,
+  // para no mezclar un draft huérfano con un flightId distinto.
+  const matchedPrefDraft =
+    prefDraft && prefDraft.id === flagState.flightId ? prefDraft : null;
+
+  // Hay grabación activa — verificar coherencia con IDB
+  if (idbSession && idbSession.flightId !== flagState.flightId) {
+    // IDB apunta a otro vuelo → descartarlo y tratar como partial.
+    await deleteActiveSession();
+    return {
+      isRecording: true,
+      session: null,
+      flightId: flagState.flightId,
+      startedAt: flagState.startedAt ?? null,
+      autoStopAt: flagState.autoStopAt ?? null,
+      prefDraft: matchedPrefDraft,
+      recoveryMode: 'partial',
+    };
+  }
+
+  return {
+    isRecording: true,
+    session: idbSession ?? null,
+    flightId: flagState.flightId,
+    startedAt: flagState.startedAt ?? null,
+    autoStopAt: flagState.autoStopAt ?? null, // conservar timeout también en partial
+    prefDraft: matchedPrefDraft,
+    recoveryMode: idbSession ? 'full' : 'partial',
+  };
+}
+
+/**
+ * Detecta si el auto-stop ha vencido.
+ * @returns {boolean}
+ */
+export async function isAutoStopExpired() {
+  const state = await prefGet();
+  if (!state?.autoStopAt) return false;
+  return new Date() > new Date(state.autoStopAt);
+}
